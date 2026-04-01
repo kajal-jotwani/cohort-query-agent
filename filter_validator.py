@@ -2,12 +2,10 @@
 filter_validator.py
 Pre-execution schema validator for LLM-generated GraphQL filters.
 
-currently the filter goes straight to Guppy API with no
-validation. Hallucinated field names only surface as cryptic API errors.
+Without this check, invalid filters only fail later at the API layer.
 
-This module runs BEFORE the filter reaches Guppy and returns structured
-errors that the UI can display and optionally feed back to the LLM for
-self-correction.
+This module validates filters early and returns structured errors that can be
+shown in UI or used for retry logic.
 
 Operators validated:
     IN     - field must exist, must be enum type, values must be in allowed set
@@ -70,7 +68,7 @@ def validate_filter(filter_obj: dict, path: str = "root") -> list[ValidationErro
 
         op_path = f"{path}.{operator}"
 
-        # AND 
+        # AND
         if operator == "AND":
             if not isinstance(value, list):
                 errors.append(ValidationError(op_path, "AND must be an array"))
@@ -78,7 +76,7 @@ def validate_filter(filter_obj: dict, path: str = "root") -> list[ValidationErro
             for i, clause in enumerate(value):
                 errors.extend(validate_filter(clause, f"{op_path}[{i}]"))
 
-        # IN 
+        # IN
         elif operator == "IN":
             if not isinstance(value, dict):
                 errors.append(ValidationError(op_path, "IN must map field_name -> [values]"))
@@ -118,7 +116,7 @@ def validate_filter(filter_obj: dict, path: str = "root") -> list[ValidationErro
                             suggestion
                         ))
 
-        # GTE / LTE 
+        # GTE / LTE
         elif operator in ("GTE", "LTE"):
             if not isinstance(value, dict):
                 errors.append(ValidationError(op_path, f"{operator} must map field_name -> numeric_value"))
@@ -141,7 +139,7 @@ def validate_filter(filter_obj: dict, path: str = "root") -> list[ValidationErro
                 if not isinstance(field_value, (int, float)):
                     errors.append(ValidationError(fpath, f"{operator} value must be a number, got {type(field_value).__name__}"))
 
-        #  nested 
+        # nested
         elif operator == "nested":
             if not isinstance(value, dict):
                 errors.append(ValidationError(op_path, "nested must be an object with 'path' and 'AND'"))
@@ -182,7 +180,7 @@ def validate_filter(filter_obj: dict, path: str = "root") -> list[ValidationErro
                                         ))
                         errors.extend(child_errors)
 
-        #  unknown operator
+        # unknown operator
         elif operator not in ("path",):   # "path" is a known nested key, not an operator
             errors.append(ValidationError(op_path, f'unknown operator "{operator}" - valid: AND, IN, GTE, LTE, nested'))
 
@@ -195,9 +193,9 @@ def validate_and_report(filter_obj: dict) -> tuple[bool, str]:
     """
     errors = validate_filter(filter_obj)
     if not errors:
-        return True, "OK Filter is valid - all fields, types, and enum values confirmed against PCDC schema"
+        return True, "Filter is valid. Fields, types, and enum values match the schema."
 
-    lines = [f"X {len(errors)} validation error(s) found:\n"]
+    lines = [f"Found {len(errors)} validation error(s):\n"]
     for e in errors:
         lines.append(f"  * {e}")
     return False, "\n".join(lines)

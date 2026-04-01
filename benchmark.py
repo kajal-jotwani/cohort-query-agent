@@ -1,17 +1,13 @@
 """
 benchmark.py
 
-Evaluation harness for the schema linker and filter validator.
+Simple benchmark runner for the schema linker and filter validator.
 
-Runs the 20-query ground-truth dataset through the linker and reports:
-  - Field match accuracy (did the right PCDC fields get retrieved?)
-  - Latency per query (real wall-clock time, not simulated)
-  - LLM call count comparison: old approach vs new approach
-  - Validation correctness: valid filters pass, invalid filters are caught
-
-This is the prototype of the evaluation described in Section 5 of the proposal.
-In the full system, the ground-truth CSV would have 50+ queries paired with
-actual Guppy _totalCount results verified against portal.pedscommons.org/query
+It reports:
+    - field retrieval recall
+    - per-query latency
+    - rough LLM-call savings compared to the older flow
+    - validator pass/fail correctness
 """
 
 import time
@@ -20,9 +16,9 @@ from schema_linker import SchemaLinker
 from filter_validator import validate_and_report
 
 
-#  Ground truth dataset 
+# Ground truth dataset
 # Format: (natural_language_query, expected_pcdc_fields, query_type)
-# expected_pcdc_fields = the fields a correct implementation MUST retrieve
+# expected_pcdc_fields = fields expected for a reasonable match
 GROUND_TRUTH = [
     # All field names sourced from processed_gitops.json in PR #5
     (
@@ -127,7 +123,7 @@ GROUND_TRUTH = [
     ),
 ]
 
-#  Validation test cases 
+# Validation test cases
 # (description, filter_object, should_be_valid)
 VALIDATION_CASES = [
     # Field names sourced from processed_gitops.json in PR #5
@@ -257,11 +253,10 @@ def print_report(linker_results: list, validator_results: list):
     W = 72
 
     def box(title):
-        print(f"\n{'-'*W}")
         print(f"  {title}")
-        print(f"{'-'*W}")
 
-    box("SCHEMA LINKER BENCHMARK  -  20 ground-truth queries")
+
+    box("Schema linker benchmark (20 queries)")
     print(f"  {'Query (truncated)':<42} {'Type':<14} {'Recall':<8} {'ms':<7} {'Saved'}")
     print(f"  {'-'*42} {'-'*14} {'-'*8} {'-'*7} {'-'*5}")
 
@@ -269,7 +264,7 @@ def print_report(linker_results: list, validator_results: list):
     for r in linker_results:
         q_short = r["query"][:40] + ".." if len(r["query"]) > 40 else r["query"]
         recall_str = f"{r['recall']:.0%}"
-        mark = "OK" if r["recall"] >= 0.8 else ("~" if r["recall"] >= 0.5 else "X")
+        mark = "Good" if r["recall"] >= 0.8 else ("Fair" if r["recall"] >= 0.5 else "Low")
         print(f"  {q_short:<42} {r['type']:<14} {mark} {recall_str:<6} {r['vector_ms']:<7.1f} -{r['calls_saved']}")
         recalls.append(r["recall"])
         latencies.append(r["vector_ms"])
@@ -283,7 +278,7 @@ def print_report(linker_results: list, validator_results: list):
     print(f"\n  Average recall        : {avg_recall:.1%}  ({perfect}/{len(recalls)} perfect matches)")
     print(f"  Average vector latency: {avg_latency:.2f}ms per query")
     print(f"  Total LLM calls saved : {total_saved} calls across {len(linker_results)} queries")
-    print(f"  Est. time saved (GPT-4o at ~1400ms/call): {total_saved * 1.4:.1f}s")
+    print(f"  Estimated time saved (assuming ~1400ms/call): {total_saved * 1.4:.1f}s")
 
     # Breakdown by type
     by_type = {}
@@ -293,14 +288,13 @@ def print_report(linker_results: list, validator_results: list):
     for qtype, recs in sorted(by_type.items()):
         print(f"    {qtype:<20} {sum(recs)/len(recs):.0%}  ({len(recs)} queries)")
 
-    box("FILTER VALIDATOR BENCHMARK  -  8 test cases")
+    box("Filter validator benchmark (8 cases)")
     print(f"  {'Test case':<52} {'Expected':<10} {'Got':<10} {'Pass?'}")
-    print(f"  {'-'*52} {'-'*10} {'-'*10} {'-'*5}")
 
     correct_count = 0
     for r in validator_results:
         desc_short = r["desc"][:50] + ".." if len(r["desc"]) > 50 else r["desc"]
-        mark = "OK" if r["correct"] else "X"
+        mark = "Pass" if r["correct"] else "Fail"
         print(f"  {desc_short:<52} {r['expected']:<10} {r['got']:<10} {mark}")
         if r["correct"]:
             correct_count += 1
@@ -313,7 +307,7 @@ def print_report(linker_results: list, validator_results: list):
     print(f"  False positives (valid rejected): {sum(1 for r in validator_results if not r['correct'] and r['expected']=='VALID')}")
     print(f"  False negatives (invalid passed): {sum(1 for r in validator_results if not r['correct'] and r['expected']=='INVALID')}")
 
-    box("SUMMARY")
+    box("Summary")
     print(f"  Schema linker avg recall  : {avg_recall:.1%}")
     print(f"  Schema linker avg latency : {avg_latency:.2f}ms  (vs ~1200-2000ms per LLM call)")
     print(f"  Validator accuracy        : {correct_count/len(validator_results):.0%}")
@@ -323,17 +317,17 @@ def print_report(linker_results: list, validator_results: list):
 
 
 if __name__ == "__main__":
-    print("\nBuilding TF-IDF index over PCDC schema...")
+    print("\nBuilding TF-IDF index...")
     t0 = time.perf_counter()
     linker = SchemaLinker()
     build_ms = (time.perf_counter() - t0) * 1000
-    print(f"Index built in {build_ms:.1f}ms  ({len(linker.fields)} fields, one-time startup cost)\n")
+    print(f"Index built in {build_ms:.1f}ms ({len(linker.fields)} fields, one-time startup cost)\n")
 
     linker_results    = run_linker_benchmark(linker)
     validator_results = run_validator_benchmark()
     print_report(linker_results, validator_results)
 
     # Also show a detailed trace for one interesting query
-    print("\nDETAILED TRACE - complex multi-condition query:")
+    print("\nDetailed trace for one multi-condition query:")
     demo = linker.link("INRG patients with metastatic bone disease at initial diagnosis")
     print(demo.summary())

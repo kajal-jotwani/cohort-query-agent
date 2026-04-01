@@ -1,29 +1,10 @@
 """
 schema_linker.py
 
-Replaces the N+1 LLM disambiguation loop in nested_graphql_helper.py.
+Lightweight schema linker for natural-language cohort queries.
 
-Current code (the problem):
-    # query_processed_pcdc_result() makes one GPT-4o call per ambiguous keyword
-    for keyword in keywords:
-        result = await query_processed_pcdc_result(keyword, candidates)  # 1 LLM call each
-
-This module (the fix):
-    linker = SchemaLinker(pcdc_schema_path, gitops_path)
-    matches = linker.link(user_query)   # 0 LLM calls for clear matches
-    # Only genuinely ambiguous pairs go to a single batched LLM call
-
-How it works:
-    1. At init: build TF-IDF matrix over all PCDC field descriptions
-       (field name + table + type + enum values concatenated as a document)
-    2. At query time: transform user query into same TF-IDF space,
-       compute cosine similarity against every field document
-    3. Fields above DIRECT_THRESHOLD are returned as direct hits
-    4. Fields where top-2 scores are within AMBIGUOUS_DELTA go to LLM batch
-    5. LLM batch is a single call resolving all ambiguities at once
-
-This is a drop-in replacement that keeps the same output contract:
-    {field_name: {table, type, enums, score, resolution_method}}
+It ranks fields with TF-IDF + cosine similarity and only leaves close calls
+for downstream disambiguation.
 """
 
 import json
@@ -39,30 +20,16 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
-#  Tunable thresholds 
+# Tunable thresholds
 DIRECT_THRESHOLD = 0.15   # cosine score above this = direct vector hit, no LLM
 AMBIGUOUS_DELTA  = 0.04   # if top-2 scores are within this, flag as ambiguous
 MIN_SCORE        = 0.05   # below this = not relevant, ignore entirely
 TOP_K            = 3      # number of candidates to return per query term
 
 
-#  PCDC schema embedded directly (mirrors what parse_pcdc_schema_prod()
-#    produces after caching to processed_pcdc_schema_prod.json) 
-#
-#    In the real system this would be loaded from:
-#        json.load(open("schema/pcdc-schema-prod-20250114.json"))
-#    We embed a representative subset here so the prototype is self-contained.
-
-
-# Fields sourced directly from processed_gitops.json (PR #5, Sep 2025)
-# and processed_pcdc_schema_prod.json in the repository.
-# Table mappings match the gitops file exactly.
-# Note: disease_phase does NOT appear in processed_gitops.json -
-# this is precisely why end-to-end nested generation for it is incomplete
-# and listed as a README TODO. We represent it here for the schema linker
-# to detect and flag as requiring special handling.
+# Embedded subset for local prototyping.
 PCDC_FIELDS = [
-    #  Subject-level fields (empty list in gitops = top-level, no nested path) 
+    # Subject-level fields (empty list in gitops = top-level, no nested path)
     {
         "field":  "consortium",
         "table":  "subject",
@@ -98,7 +65,7 @@ PCDC_FIELDS = [
         "enums":  [],
         "desc":   "patient age at censor status years days enrollment study pediatric child young under over"
     },
-    #  tumor_assessments 
+    # tumor_assessments
     {
         "field":  "tumor_classification",
         "table":  "tumor_assessments",
@@ -135,7 +102,7 @@ PCDC_FIELDS = [
         "enums":  ["Invasive", "Non-invasive", "Unknown"],
         "desc":   "tumor invasiveness invasive non-invasive extent"
     },
-    #  survival_characteristics 
+    # survival_characteristics
     {
         "field":  "lkss",
         "table":  "survival_characteristics",
@@ -150,7 +117,7 @@ PCDC_FIELDS = [
         "enums":  [],
         "desc":   "patient age at last known survival status years days alive follow-up duration"
     },
-    #  subject_responses 
+    # subject_responses
     {
         "field":  "response",
         "table":  "subject_responses",
@@ -166,7 +133,7 @@ PCDC_FIELDS = [
         "enums":  ["Yes", "No", "Unknown"],
         "desc":   "treatment prior response therapy before"
     },
-    #  molecular_analysis 
+    # molecular_analysis
     {
         "field":  "molecular_abnormality",
         "table":  "molecular_analysis",
@@ -181,10 +148,7 @@ PCDC_FIELDS = [
         "enums":  ["Absent", "Focal", "Diffuse", "Unknown"],
         "desc":   "anaplasia focal diffuse absent molecular pathology"
     },
-    #  disease_phase: NOT in processed_gitops.json - README TODO -
-    # This field exists in the PCDC schema but has no gitops path mapping yet.
-    # Including it here so the schema linker can identify it and flag it
-    # as requiring the disease_phase-specific handling (Deliverable A2).
+    # disease_phase currently has no gitops path mapping.
     {
         "field":  "disease_phase",
         "table":  "UNMAPPED",
@@ -195,10 +159,7 @@ PCDC_FIELDS = [
     },
 ]
 
-# GitOps map - sourced from schema/processed_gitops.json in PR #5.
-# Fields mapping to [] are subject-level (no nested path needed).
-# disease_phase is intentionally absent from the real gitops file -
-# this is the root cause of the README TODO.
+# GitOps field-to-path map. Empty list means subject-level field.
 GITOPS_MAP = {
     "consortium":              [],
     "sex":                     [],
@@ -235,17 +196,10 @@ GITOPS_MAP = {
 
 class SchemaLinker:
     """
-    Builds a TF-IDF index over PCDC schema field descriptions at init time.
-    Links natural language query terms to schema fields via cosine similarity.
+    TF-IDF based field linker.
 
-    Usage (drop-in for the disambiguation loop in nested_graphql_helper.py):
-
-        linker = SchemaLinker()
-        result = linker.link("metastatic bone tumor INRG patients under 10")
-        # result.direct_hits   - matched via vector sim, no LLM needed
-        # result.needs_llm     - ambiguous pairs to send to single batched LLM call
-        # result.all_fields    - combined final field list
-        # result.timing        - real elapsed ms for each stage
+    Startup builds the index once. Each query is then ranked with cosine
+    similarity and split into direct hits vs ambiguous candidates.
     """
 
     def __init__(self, fields: list[dict] = None):
@@ -254,8 +208,7 @@ class SchemaLinker:
 
     def _build_index(self):
         """
-        Build TF-IDF matrix once at startup.
-        Each field becomes one document: name + table + type + enums + desc
+        Build the TF-IDF matrix once at startup.
         """
         t0 = time.perf_counter()
 
@@ -388,17 +341,17 @@ class LinkResult:
             f"Classify     : {self.timing.get('classify_ms', 0):.2f}ms",
             f"Total vector : {self.total_vector_ms():.2f}ms",
             "",
-            f"Direct hits  : {len(self.direct_hits)} field(s) resolved by vector search - 0 LLM calls needed",
+            f"Direct hits  : {len(self.direct_hits)} field(s) resolved by vector search (no LLM call needed)",
         ]
         for h in self.direct_hits:
-            lines.append(f"  OK  {h['field']:35s} score={h['score']:.4f}  table={h['table']}")
+            lines.append(f"  - {h['field']:35s} score={h['score']:.4f}  table={h['table']}")
 
         if self.ambiguous:
-            lines.append(f"\nAmbiguous    : {len(self.ambiguous)} field(s) -> 1 batched LLM call to resolve all")
+            lines.append(f"\nAmbiguous    : {len(self.ambiguous)} field(s) need one batched LLM pass")
             for a in self.ambiguous:
-                lines.append(f"  ?  {a['field']:35s} score={a['score']:.4f}  (too close to distinguish by vector alone)")
+                lines.append(f"  - {a['field']:35s} score={a['score']:.4f}  (scores are too close to auto-pick)")
         else:
-            lines.append("\nAmbiguous    : 0 - all resolved by vector search, no LLM disambiguation needed")
+            lines.append("\nAmbiguous    : 0 (vector search was enough for this query)")
 
         old_calls = len(self.direct_hits) + len(self.ambiguous) + 1  # old: 1 per term + 1 gen
         new_calls = (1 if self.ambiguous else 0) + 1                  # new: 0-1 batch + 1 gen
@@ -406,6 +359,6 @@ class LinkResult:
             "",
             f"Old approach : {old_calls} sequential LLM calls (est. {old_calls * 1200}-{old_calls * 2000}ms)",
             f"New approach : {new_calls} LLM call(s) + {self.total_vector_ms():.1f}ms vector search",
-            f"Calls saved  : {old_calls - new_calls} LLM call(s) eliminated per query",
+            f"Calls saved  : {old_calls - new_calls} fewer LLM call(s) for this query",
         ]
         return "\n".join(lines)

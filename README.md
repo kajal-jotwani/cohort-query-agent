@@ -1,56 +1,55 @@
-# PCDC Schema Linker - Working Prototype
-### GSoC 2025 Proposal - Enhancing the Cohort Discovery Chatbot
+# Cohort Query Agent Prototype
 
-This is a **working prototype** of two core components proposed in my GSoC 2026
-application. Both run locally with no API keys
+This repository contains a small local prototype for two pieces of the cohort query flow:
 
+1. Schema linking from natural language to PCDC fields
+2. Filter validation before sending a query to Guppy
 
+Everything runs locally and does not require API keys.
 
-## What this demonstrates
+## What is included
 
-### 1. `schema_linker.py` - Replaces the N+1 LLM loop (fixes Issue #9)
+### schema_linker.py
 
-The current codebase in `nested_graphql_helper.py` makes one GPT-4o call per
-ambiguous keyword during schema disambiguation:
+`SchemaLinker` builds a TF-IDF index over schema field descriptions and uses cosine similarity to find likely field matches for a query.
 
-```python
-# Current code - the problem
-for keyword in keywords:
-    result = await query_processed_pcdc_result(keyword, candidates)
-    # ^ one sequential LLM call per term = 30+ second total latency
-```
-
-`SchemaLinker` replaces this with a TF-IDF cosine similarity index built
-over the PCDC schema at startup. Clear matches resolve in under 2ms with
-zero LLM calls. Only genuinely ambiguous pairs go to a single batched call.
+- Clear matches are returned directly
+- Uncertain matches are marked as ambiguous so they can be handled in one batched LLM call later
 
 ```python
-# Proposed replacement
+from schema_linker import SchemaLinker
+
 linker = SchemaLinker()
 result = linker.link("INRG patients with metastatic bone tumors")
-# result.direct_hits  -> resolved by vector search, no LLM
-# result.ambiguous    -> goes to ONE batched LLM call
+print(result.summary())
 ```
 
-### 2. `filter_validator.py` - Pre-execution schema validation (fixes Issue #14)
+### filter_validator.py
 
-The current system sends LLM-generated filters straight to the Guppy API.
-Hallucinated field names produce cryptic API errors.
+`validate_and_report()` checks filter structure and values against the schema before execution.
 
-`validate_and_report()` checks every field name, enum value, operator type,
-and nested path against the PCDC schema before the query runs:
+It validates:
+
+- field names
+- enum values
+- operator usage (`IN` vs `GTE`/`LTE`)
+- nested table paths
+- field/table alignment inside nested blocks
 
 ```python
-is_valid, report = validate_and_report(generated_filter)
-# Catches: unknown fields, wrong enum values, numeric fields with IN,
-#          wrong nested paths, cross-table field contamination
+from filter_validator import validate_and_report
+
+is_valid, report = validate_and_report({
+  "AND": [{"IN": {"tumor_stage": ["Metastatic"]}}]
+})
+print(report)
 ```
 
----
+## Sample benchmark output
 
-## Benchmark results (from running benchmark.py)
+From `benchmark.py`:
 
-```
+```text
 Schema linker avg recall   : 89.6%  (15/20 perfect field matches)
 Schema linker avg latency  : 1.03ms per query
 Validator accuracy         : 100%   (8/8 test cases)
@@ -58,48 +57,39 @@ LLM calls eliminated       : 111 / 149 total old calls across 20 queries
 Speedup factor             : ~3.9x fewer LLM calls
 ```
 
-The 4 partial-recall cases (50-75% recall) are queries involving numeric age
-ranges like "under 5 years old" - the TF-IDF model conflates
-`age_at_enrollment` (subject-level) with `age_at_tumor_assessment`
-(tumor_assessments table). This is the exact ambiguity that motivates the
-batched LLM fallback in the proposed design.
+Some lower-recall queries are age-range phrased prompts (for example "under 5 years old"), where similarly named age fields compete.
 
----
-
-## How to run
+## Run locally
 
 ```bash
-# Requirements: Python 3.11+, numpy, scikit-learn
 pip install numpy scikit-learn
-
-# Run the full benchmark (20 linker queries + 8 validator cases)
 python benchmark.py
+```
 
-# Try the linker interactively
+Quick linker check:
+
+```bash
 python -c "
 from schema_linker import SchemaLinker
 linker = SchemaLinker()
-result = linker.link('your query here')
-print(result.summary())
+print(linker.link('INRG patients with metastatic bone tumors').summary())
 "
+```
 
-# Try the validator interactively
+Quick validator check:
+
+```bash
 python -c "
 from filter_validator import validate_and_report
-ok, report = validate_and_report({
-    'AND': [
-        {'IN': {'tumor_stage': ['Metastatic']}}  # hallucinated field name
-    ]
-})
+ok, report = validate_and_report({'AND': [{'IN': {'tumor_stage': ['Metastatic']}}]})
 print(report)
 "
 ```
 
-## What's not in this prototype
+## Scope notes
 
-- The LLM generation step (needs OpenAI/Anthropic API key)
-- The LangChain agent / intent router (Deliverable C)
-- The full PCDC schema (this uses a representative 14-field subset;
-  the real schema has ~200+ fields, which would improve recall further)
-- FAISS index (replaced here with sklearn cosine_similarity for portability;
-  the real implementation uses FAISS for sub-millisecond search at scale)
+This is intentionally a compact prototype. It does not include:
+
+- full LLM generation + routing flow
+- full production schema coverage
+- FAISS indexing (uses sklearn cosine similarity for portability)
